@@ -1,0 +1,80 @@
+'use client';
+
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { buildEvidenceCsv, extractApprovalThreshold, inferMapping, normalizeRows, parseCsv, scoreTransactions, summarize } from '../lib/audit';
+import type { AuditTransaction, PolicyConfig, ReviewStatus, RiskCase } from '../lib/types';
+
+const requiredFields: Array<keyof AuditTransaction> = ['date','amount'];
+const optionalFields: Array<keyof AuditTransaction> = ['id','vendor','employee','category','description','paymentMethod','approver','account'];
+const labels: Record<keyof AuditTransaction,string> = { id:'Transaction ID', date:'Date', amount:'Amount', vendor:'Vendor / supplier', employee:'Employee / requester', category:'Category', description:'Description', paymentMethod:'Payment method', approver:'Approver', account:'Beneficiary account' };
+
+const demoCsv = `transaction_id,date,amount,vendor,employee,category,description,payment_method,approver,account
+T001,2026-07-01,4200,Metro Hotels,Aarav,Travel,Hotel stay,Card,R. Shah,H-001
+T002,2026-07-04,4350,Metro Hotels,Aarav,Travel,Hotel stay,Card,R. Shah,H-001
+T003,2026-07-07,3900,City Cab,Diya,Travel,Airport taxi,Card,R. Shah,C-991
+T004,2026-07-10,5100,Metro Hotels,Kabir,Travel,Hotel stay,Card,R. Shah,H-001
+T005,2026-07-13,4550,City Cab,Aarav,Travel,Client travel,Card,R. Shah,C-991
+T006,2026-07-16,4700,Metro Hotels,Diya,Travel,Hotel stay,Card,R. Shah,H-001
+T007,2026-07-18,49800,Prime Advisory,Om,Consulting,Phase 1 advisory,Transfer,R. Shah,PA-440
+T008,2026-07-18,49600,Prime Advisory,Om,Consulting,Phase 2 advisory,Transfer,R. Shah,PA-440
+T009,2026-07-20,18000,North Star Media,Diya,Marketing,Campaign support,Transfer,R. Shah,NS-221
+T010,2026-07-20,18000,North Star Media,Diya,Marketing,Campaign support,Transfer,R. Shah,NS-221
+T011,2026-07-21,12000,Alpha Systems,Kabir,IT,Software setup,Transfer,R. Shah,SHARED-9
+T012,2026-07-22,11600,Beta Systems,Kabir,IT,License setup,Transfer,R. Shah,SHARED-9
+T013,2026-07-24,75000,One-Off Services,Aarav,Services,Urgent services,Transfer,,OO-99
+T014,2026-07-25,4400,Metro Hotels,Aarav,Travel,Hotel stay,Card,R. Shah,H-001
+T015,2026-07-27,4600,City Cab,Diya,Travel,Client taxi,Card,R. Shah,C-991`;
+
+function money(n:number) { return new Intl.NumberFormat('en-IN',{style:'currency',currency:'INR',maximumFractionDigits:0}).format(n); }
+function download(name:string, content:string, type='text/csv') { const url=URL.createObjectURL(new Blob([content],{type})); const a=document.createElement('a'); a.href=url; a.download=name; a.click(); URL.revokeObjectURL(url); }
+
+function Severity({ score }: { score:number }) {
+  const label = score >= 60 ? 'High' : score >= 30 ? 'Review' : score > 0 ? 'Watch' : 'Low';
+  return <span className={`severity severity--${label.toLowerCase()}`}>{label} · {score}</span>;
+}
+
+function CaseDrawer({ item, status, note, onStatus, onNote, onClose }: { item:RiskCase; status:ReviewStatus; note:string; onStatus:(s:ReviewStatus)=>void; onNote:(n:string)=>void; onClose:()=>void }) {
+  return <div className="drawer-backdrop" onMouseDown={onClose}><aside className="drawer" onMouseDown={(e)=>e.stopPropagation()} aria-label="Transaction investigation panel">
+    <div className="drawer-head"><div><p className="eyebrow">Investigation case</p><h2>{item.transaction.id}</h2></div><button className="icon-button" onClick={onClose} aria-label="Close">×</button></div>
+    <div className="case-hero"><div><span>{item.transaction.vendor}</span><strong>{money(item.transaction.amount)}</strong><small>{item.transaction.date} · {item.transaction.employee}</small></div><Severity score={item.score}/></div>
+    <div className="confidence-strip"><span><b>Known</b> direct file facts</span><span><b>Statistical</b> peer deviation</span><span><b>Heuristic</b> review cue, not proof</span></div>
+    <section><h3>Why it was surfaced</h3><div className="signal-stack">{item.signals.length ? item.signals.map((s)=><article key={s.code} className="signal"><div><b>{s.label}</b><span className={`kind kind--${s.kind}`}>{s.kind}</span></div><p>{s.detail}</p><small>+{Math.round(s.points)} risk points</small></article>) : <p className="muted">No configured risk signal fired.</p>}</div></section>
+    <section><h3>Peer context</h3><div className="peer-grid"><div><span>Peer median</span><strong>{money(item.peerMedian)}</strong></div><div><span>Comparison rows</span><strong>{item.peerCount}</strong></div><div><span>Category</span><strong>{item.transaction.category}</strong></div></div></section>
+    <section><h3>Review decision</h3><div className="status-row">{(['New','Reviewing','Explained','Escalate'] as ReviewStatus[]).map((s)=><button key={s} className={status===s?'status-button active':'status-button'} onClick={()=>onStatus(s)}>{s}</button>)}</div><textarea value={note} onChange={(e)=>onNote(e.target.value)} placeholder="Add analyst notes, evidence checked, or explanation..." /></section>
+    <div className="truth-note"><b>AuditLens does not label fraud.</b> A high score means the transaction deserves review under the available data and configured rules.</div>
+  </aside></div>;
+}
+
+export function AuditLensApp() {
+  const inputRef=useRef<HTMLInputElement>(null);
+  const [stage,setStage]=useState<'upload'|'map'|'workspace'>('upload');
+  const [fileName,setFileName]=useState('');
+  const [rows,setRows]=useState<string[][]>([]);
+  const [mapping,setMapping]=useState<Partial<Record<keyof AuditTransaction,string>>>({});
+  const [records,setRecords]=useState<AuditTransaction[]>([]);
+  const [rejected,setRejected]=useState<string[]>([]);
+  const [policy,setPolicy]=useState<PolicyConfig>({approvalThreshold:50000,weekendRequiresJustification:true});
+  const [policyText,setPolicyText]=useState('Manager approval required above INR 50000. Weekend purchases require justification.');
+  const [reviewCapacity,setReviewCapacity]=useState(10);
+  const [statuses,setStatuses]=useState<Record<string,ReviewStatus>>({});
+  const [notes,setNotes]=useState<Record<string,string>>({});
+  const [selected,setSelected]=useState<RiskCase|null>(null);
+  const [filter,setFilter]=useState<'all'|'high'|'unreviewed'|'escalate'>('all');
+  useEffect(()=>{ if(new URLSearchParams(window.location.search).get('demo')==='1' && stage==='upload') loadCsv(demoCsv,'auditlens-demo.csv'); },[]);
+  const cases=useMemo(()=>scoreTransactions(records,policy),[records,policy]);
+  const summary=useMemo(()=>summarize(cases,25),[cases]);
+  const queue=useMemo(()=>cases.filter((c)=>c.score>0).filter((c)=>filter==='all'||(filter==='high'&&c.score>=60)||(filter==='unreviewed'&&(statuses[c.transaction.id]??'New')==='New')||(filter==='escalate'&&statuses[c.transaction.id]==='Escalate')).slice(0,reviewCapacity),[cases,filter,reviewCapacity,statuses]);
+
+  function loadCsv(text:string,name:string){ const parsed=parseCsv(text); if(parsed.length<2) return; setRows(parsed); setFileName(name); setMapping(inferMapping(parsed[0])); setStage('map'); }
+  async function file(file:File){ const text=await file.text(); loadCsv(text,file.name); }
+  function analyze(){ const result=normalizeRows(rows,mapping); if(!result.records.length) return; setRecords(result.records); setRejected(result.rejected); setStage('workspace'); }
+  function applyPolicy(){ const extracted=extractApprovalThreshold(policyText); setPolicy((p)=>({...p,approvalThreshold:extracted??p.approvalThreshold,weekendRequiresJustification:/weekend/i.test(policyText)})); }
+
+  if(stage==='upload') return <main className="landing"><nav><a className="brand" href="#"><span>A</span>AuditLens</a><div>Day 07 · Explainable audit triage</div></nav><section className="landing-grid"><div className="hero-copy"><p className="eyebrow">Privacy-first internal audit analytics</p><h1>Spend review time<br/><em>where it matters.</em></h1><p>Upload transaction data. AuditLens combines transparent anomaly signals, peer context and policy cues into a ranked review queue — without pretending an anomaly is fraud.</p><div className="hero-actions"><button className="button" onClick={()=>inputRef.current?.click()}>Upload transaction CSV</button><button className="button secondary" onClick={()=>loadCsv(demoCsv,'auditlens-demo.csv')}>Open interactive demo</button><button className="link-button" onClick={()=>download('auditlens-template.csv','transaction_id,date,amount,vendor,employee,category,description,payment_method,approver,account\nT001,2026-08-01,12500,Example Vendor,Employee A,Travel,Hotel stay,Card,Manager,ACC-001')}>Download CSV template ↓</button></div><input ref={inputRef} hidden type="file" accept=".csv,text/csv" onChange={(e)=>{const f=e.target.files?.[0];if(f)void file(f)}}/><div className="hero-foot"><span>✓ Browser-local analysis</span><span>✓ No login</span><span>✓ Evidence export</span></div></div><aside className="preview-card"><div className="preview-top"><span>Review queue</span><b>Explainable, not mysterious</b></div><div className="preview-case high"><div><strong>Possible duplicate</strong><span>Same vendor · amount · date</span></div><b>72</b></div><div className="preview-case"><div><strong>Split threshold pattern</strong><span>2 payments under approval limit</span></div><b>61</b></div><div className="preview-case"><div><strong>Shared vendor account</strong><span>2 supplier names · same account</span></div><b>34</b></div><div className="preview-note"><b>Confidence layer</b><p>Every signal is labeled as a file fact, statistical estimate, or heuristic review cue.</p></div></aside></section><section className="workflow"><div><b>01</b><span>Upload</span><small>CSV ledger/export</small></div><div><b>02</b><span>Map</span><small>Confirm fields</small></div><div><b>03</b><span>Prioritize</span><small>Rank review cases</small></div><div><b>04</b><span>Investigate</span><small>Document outcome</small></div><div><b>05</b><span>Export</span><small>Evidence pack</small></div></section></main>;
+
+  if(stage==='map') { const headers=rows[0]??[]; return <main className="mapping-page"><div className="shell"><div className="topbar"><a className="brand dark" onClick={()=>setStage('upload')}><span>A</span>AuditLens</a><span>{fileName} · {(rows.length-1).toLocaleString()} rows</span></div><div className="map-head"><div><p className="eyebrow">Data contract</p><h1>Confirm what each column means.</h1><p>Only date and amount are required. More context makes peer comparison and reason codes stronger.</p></div><button className="button secondary" onClick={()=>setStage('upload')}>Choose another file</button></div><div className="mapping-grid">{[...requiredFields,...optionalFields].map((field)=><label key={field}><span>{labels[field]} {requiredFields.includes(field)&&<em>required</em>}</span><select value={mapping[field]??''} onChange={(e)=>setMapping({...mapping,[field]:e.target.value})}><option value="">Not mapped</option>{headers.map((h)=><option key={h} value={h}>{h}</option>)}</select></label>)}</div><div className="policy-box"><div><p className="eyebrow">Optional policy cues</p><h2>Paste a few approval rules.</h2><p>AuditLens can extract the largest explicit monetary threshold and detect a weekend-justification rule. This is a transparent heuristic parser, not legal interpretation.</p></div><textarea value={policyText} onChange={(e)=>setPolicyText(e.target.value)}/><button className="text-action" onClick={applyPolicy}>Extract rules →</button><div className="policy-result"><span>Approval threshold <b>{money(policy.approvalThreshold)}</b></span><span>Weekend justification <b>{policy.weekendRequiresJustification?'On':'Off'}</b></span></div></div><div className="map-footer"><span>Your file is processed in this browser session.</span><button className="button" disabled={!mapping.date||!mapping.amount} onClick={analyze}>Build review queue →</button></div></div></main>; }
+
+  return <main className="workspace"><header className="workspace-head"><div><a className="brand" onClick={()=>setStage('upload')}><span>A</span>AuditLens</a><p>{fileName} · {records.length.toLocaleString()} accepted rows{rejected.length?` · ${rejected.length} rejected`:''}</p></div><div className="head-actions"><button className="button secondary" onClick={()=>setStage('upload')}>New file</button><button className="button" onClick={()=>download('auditlens-evidence-pack.csv',buildEvidenceCsv(cases,statuses,notes))}>Export evidence pack</button></div></header><div className="workspace-shell"><section className="workspace-title"><div><p className="eyebrow">Review command center</p><h1>Prioritize evidence, not suspicion.</h1></div><div className="truth-chip"><b>No fraud labels</b><span>Risk score = review priority</span></div></section><section className="kpis"><article><span>Transactions</span><strong>{summary.transactions}</strong><small>{summary.vendors} vendors</small></article><article><span>Transaction value</span><strong>{money(summary.totalValue)}</strong><small>Known from uploaded rows</small></article><article><span>Cases ≥25</span><strong>{summary.flagged}</strong><small>{money(summary.highRiskValue)} in flagged value</small></article><article><span>Escalated</span><strong>{Object.values(statuses).filter((s)=>s==='Escalate').length}</strong><small>Analyst decision</small></article></section><section className="control-panel"><div><label>Review capacity <b>{reviewCapacity} cases</b><input type="range" min="3" max={Math.max(3,Math.min(30,cases.filter((c)=>c.score>0).length))} value={Math.min(reviewCapacity,Math.max(3,cases.filter((c)=>c.score>0).length))} onChange={(e)=>setReviewCapacity(Number(e.target.value))}/></label><p>AuditLens ranks the highest-signal cases so the queue fits your team's review capacity.</p></div><div className="filter-tabs">{([['all','Top risk'],['high','High ≥60'],['unreviewed','Unreviewed'],['escalate','Escalated']] as const).map(([key,label])=><button key={key} className={filter===key?'active':''} onClick={()=>setFilter(key)}>{label}</button>)}</div></section><section className="queue-layout"><div className="queue"><div className="section-head"><div><p className="eyebrow">Investigation queue</p><h2>Highest-value review candidates</h2></div><span>{queue.length} shown</span></div>{queue.length?queue.map((item)=><button className="case-row" key={item.transaction.id} onClick={()=>setSelected(item)}><div className="score-ring" aria-label={`Risk score ${item.score}`}>{item.score}</div><div className="case-main"><div><strong>{item.transaction.vendor}</strong><span>{item.transaction.id} · {item.transaction.date}</span></div><p>{item.signals[0]?.label??'No active signal'}{item.signals[1]?` · ${item.signals[1].label}`:''}</p></div><div className="case-value"><strong>{money(item.transaction.amount)}</strong><span>{statuses[item.transaction.id]??'New'}</span></div></button>):<div className="empty">No cases match this view.</div>}</div><aside className="coverage"><p className="eyebrow">Control coverage</p><h2>What this file can support</h2>{[
+      ['Peer amount outliers', records.length>=8, 'Statistical'],['Possible duplicate payments',true,'Known'],['Split-threshold patterns',policy.approvalThreshold>0,'Heuristic'],['Weekend policy cue',policy.weekendRequiresJustification,'Known'],['Shared beneficiary accounts',records.some((r)=>r.account!=='Unspecified account'),'Known'],['Approval evidence',records.some((r)=>r.approver!=='Unspecified approver'),'Known']
+    ].map(([name,on,kind])=><div className="coverage-row" key={String(name)}><span className={on?'dot on':'dot'}/><div><b>{name}</b><small>{on?'Available':'Not supported by current fields'} · {kind}</small></div></div>)}<div className="coverage-miss"><b>Not assessed</b><p>Identity ownership, collusion, external sanctions, procurement price fairness and actual fraud outcomes require additional data or controls.</p></div></aside></section></div>{selected&&<CaseDrawer item={selected} status={statuses[selected.transaction.id]??'New'} note={notes[selected.transaction.id]??''} onStatus={(s)=>setStatuses({...statuses,[selected.transaction.id]:s})} onNote={(n)=>setNotes({...notes,[selected.transaction.id]:n})} onClose={()=>setSelected(null)}/>}</main>;
+}
