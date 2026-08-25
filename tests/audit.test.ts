@@ -1,12 +1,15 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { extractApprovalThreshold, normalizeRows, parseCsv, scoreTransactions, summarize } from '../lib/audit.ts';
+import { extractApprovalThreshold, normalizeRows, parseAuditDate, parseCsv, scoreTransactions, summarize } from '../lib/audit.ts';
 import type { AuditTransaction } from '../lib/types.ts';
 const base:AuditTransaction[]=Array.from({length:12},(_,i)=>({id:`N${i}`,date:`2026-08-${String(1+i).padStart(2,'0')}`,amount:900+i*30,vendor:`Vendor ${i%3}`,employee:`E${i%2}`,category:'Travel',description:'normal',paymentMethod:'Card',approver:'Manager',account:`A${i%3}`}));
 test('CSV parser preserves quoted commas',()=>{const rows=parseCsv('date,amount,description\n2026-08-01,1200,"Hotel, Delhi"');assert.equal(rows[1][2],'Hotel, Delhi')});
 test('normalizer rejects invalid money rows',()=>{const rows=parseCsv('date,amount,vendor\n2026-08-01,1200,A\n2026-08-02,nope,B');const r=normalizeRows(rows,{date:'date',amount:'amount',vendor:'vendor'});assert.equal(r.records.length,1);assert.equal(r.rejected.length,1)});
+test('ambiguous slash dates are parsed day-first',()=>{assert.equal(parseAuditDate('01/02/2026'),'2026-02-01');assert.equal(parseAuditDate('31/08/2026'),'2026-08-31')});
+test('invalid calendar dates are rejected',()=>{assert.equal(parseAuditDate('31/02/2026'),null);assert.equal(parseAuditDate('2026-02-31'),null)});
 test('large peer outlier gets ranked',()=>{const cases=scoreTransactions([...base,{...base[0],id:'X',amount:25000,vendor:'Odd Vendor',account:'ZX'}],{approvalThreshold:50000,weekendRequiresJustification:false});assert.ok(cases.find(c=>c.transaction.id==='X')?.signals.some(s=>s.code==='PEER_OUTLIER'))});
 test('split threshold pattern is surfaced',()=>{const split:AuditTransaction[]=[48000,47000].map((amount,i)=>({id:`S${i}`,date:'2026-08-12',amount,vendor:'Same Vendor',employee:'E9',category:'Services',description:'consulting',paymentMethod:'Transfer',approver:'Manager',account:'SV1'}));const cases=scoreTransactions([...base,...split],{approvalThreshold:50000,weekendRequiresJustification:false});assert.ok(cases.find(c=>c.transaction.id==='S0')?.signals.some(s=>s.code==='SPLIT_THRESHOLD'))});
 test('shared account across vendor names is surfaced',()=>{const cases=scoreTransactions([...base,{...base[0],id:'A1',vendor:'Alpha Consulting',account:'SAME-001'},{...base[1],id:'A2',vendor:'Beta Advisory',account:'SAME-001'}],{approvalThreshold:50000,weekendRequiresJustification:false});assert.ok(cases.find(c=>c.transaction.id==='A1')?.signals.some(s=>s.code==='SHARED_ACCOUNT'))});
-test('policy threshold extraction uses highest explicit amount',()=>assert.equal(extractApprovalThreshold('Manager approval above INR 50000. Hotel limit Rs 12000.'),50000));
+test('policy threshold extraction uses approval-context amount',()=>assert.equal(extractApprovalThreshold('Policy document 20260101. Manager approval above INR 50000. Hotel limit Rs 12000.'),50000));
+test('unrelated large numbers do not become approval thresholds',()=>assert.equal(extractApprovalThreshold('Policy reference 20260101. Version 123456.'),null));
 test('summary counts flagged value only',()=>{const cases=scoreTransactions([...base,{...base[0],id:'X',amount:25000,vendor:'Odd Vendor',account:'ZX'}],{approvalThreshold:50000,weekendRequiresJustification:false});const s=summarize(cases,25);assert.ok(s.flagged>=1);assert.ok(s.highRiskValue>=25000)});
