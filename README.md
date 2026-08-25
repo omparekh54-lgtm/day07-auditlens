@@ -15,16 +15,40 @@ Many anomaly demos stop at red dots or a black-box score. Internal audit teams h
 AuditLens focuses on that operational loop:
 
 ```text
-CSV export → Column mapping + validation → Transparent multi-signal scoring → Capacity-limited review queue → Case-level evidence + peer context → New / Reviewing / Explained / Escalate → Analyst notes → Evidence-pack CSV
+CSV export
+   ↓
+Column mapping + validation
+   ↓
+Transparent multi-signal scoring
+   ↓
+Capacity-limited review queue
+   ↓
+Case-level evidence + peer context
+   ↓
+New / Reviewing / Explained / Escalate
+   ↓
+Analyst notes
+   ↓
+Evidence-pack CSV
 ```
 
 ## Core workflows
 
-1. **Bring your own transaction data.** The product accepts a CSV export and performs analysis locally in the browser session. Only `date` and `amount` are required. Vendor, employee, category, description, payment method, approver and beneficiary account make the review signals richer.
-2. **Fit the queue to real review capacity.** An audit team can set how many cases it can inspect. AuditLens ranks the strongest available signals instead of asking people to inspect every flag.
-3. **Investigate, document, export.** Opening a case shows transaction facts, reason codes, confidence type, peer context, analyst status and notes. The evidence pack exports all of that as CSV.
+### 1. Bring your own transaction data
+
+The production product accepts a CSV export and performs analysis locally in the browser session. Only `date` and `amount` are required. Vendor, employee, category, description, payment method, approver and beneficiary account make the review signals richer.
 
 A synthetic **Open interactive demo** exists only as an optional example. `?demo=1` opens the sample mapping workflow directly.
+
+### 2. Fit the queue to real review capacity
+
+An audit team can set how many cases it can inspect. AuditLens ranks the strongest available signals and shows only the highest-value review candidates instead of asking people to inspect every flag.
+
+### 3. Investigate, document, export
+
+Opening a case shows transaction facts, risk score, each reason code, whether the reason is **Known**, **Statistical**, or **Heuristic**, peer context, analyst status and analyst notes.
+
+The final evidence pack exports the original case facts, score, reason codes, reason details, review status and notes.
 
 ## Explainable signal ensemble
 
@@ -44,7 +68,7 @@ Scores are capped at 100 and are only used for ranking. They are not calibrated 
 
 ## Confidence & honesty layer
 
-Every reason is labelled as **Known**, **Statistical**, or **Heuristic**. The Control coverage panel also shows which checks the current file can support and lists areas that are not assessed.
+Every reason is labelled as one of **Known**, **Statistical**, or **Heuristic**. The product also exposes a **Control coverage** panel showing which checks the current file can support and explicitly lists areas that are not assessed.
 
 ## Input contract
 
@@ -57,7 +81,7 @@ date,amount
 
 Recommended columns: `transaction_id`, `date`, `amount`, `vendor`, `employee`, `category`, `description`, `payment_method`, `approver`, `account`.
 
-Common aliases are auto-detected, but the user reviews the mapping before analysis. Amount must be numeric and positive; date must parse; invalid rows are rejected; optional missing fields become explicit `Unspecified ...` values.
+Common aliases are auto-detected, but the user reviews the mapping before analysis. Amount must be numeric and positive, date must parse into a valid date, invalid rows are rejected, and optional missing fields become explicit `Unspecified ...` values.
 
 ## Policy cue parser
 
@@ -65,7 +89,9 @@ The mapping step includes an optional policy-text box. The current parser can ex
 
 ## Privacy model
 
-The transaction file is processed in browser memory. This build has no login, application database, upload bucket, or server-side transaction persistence. Analyst review status/notes remain in the active browser session and are included in the downloaded evidence pack.
+The user's transaction file is processed in browser memory. This Day 7 build has no login, application database, upload bucket, or server-side transaction persistence.
+
+Analyst review status/notes are persisted locally in browser storage per filename and are included when the evidence pack is downloaded. They are never sent to an application database.
 
 ## Data-science methodology
 
@@ -85,18 +111,46 @@ This is **not** a learned fraud probability. With labelled historical audit outc
 
 ## UI / UX decisions
 
-Clear five-step onboarding, downloadable template, responsive layout, review-capacity slider, filterable queue, side-panel investigation, confidence labels, analyst status/notes, evidence export, keyboard focus states, restrained motion, and `prefers-reduced-motion` support.
+- clear five-step onboarding
+- downloadable CSV template
+- no account required
+- responsive desktop/mobile layouts
+- review-capacity slider
+- filterable case queue
+- side-panel investigation workflow
+- confidence labels beside every reason
+- direct analyst status + notes with browser-local persistence
+- operational CSV export
+- keyboard focus states
+- restrained transitions and drawer motion
+- `prefers-reduced-motion` support
 
 ## Honest limitations
 
-AuditLens does **not** currently prove or predict fraud. It has no labelled fraud model, external sanctions/PEP lookup, verified account ownership, graph database, procurement price benchmark, or causal conclusion about split payments/round numbers. Exact duplicates and shared accounts can have legitimate explanations. Policy parsing is intentionally narrow. The first production release accepts CSV rather than XLSX/PDF.
+AuditLens does **not** currently prove or predict fraud. It has no labelled fraud model, external sanctions/PEP/vendor registry lookup, verified account ownership, graph-database/entity-resolution layer, procurement price benchmark, or causal conclusion about split payments/round numbers. Exact duplicates and shared accounts can have legitimate explanations. Policy text parsing is intentionally narrow. The first production release accepts CSV rather than XLSX/PDF.
 
 The correct interpretation of a high score is: **review this transaction before a lower-scoring one, given the currently available evidence.**
 
 ## Architecture
 
 ```text
-Next.js 16 / React 19 → Browser-local CSV parser + mapping → Normalized transaction facts → Transparent TypeScript signal engine → Capacity-ranked review queue → Analyst workflow → Evidence-pack export
+Next.js 16 / React 19
+        ↓
+Browser-local CSV parser + column mapping
+        ↓
+Normalized transaction facts
+        ↓
+Transparent audit signal engine (TypeScript)
+        ↓
+Capacity-ranked review queue
+        ↓
+Analyst workflow state
+        ↓
+Evidence-pack CSV export
 ```
 
-Core decision logic lives in `lib/audit.ts` independently of React so it can be tested directly.
+The core engine lives in `lib/audit.ts` and is independent of the React UI, which keeps the decision logic testable.
+
+## Repository
+
+`day07-auditlens`
